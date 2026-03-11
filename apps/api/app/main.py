@@ -1,7 +1,8 @@
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional, Tuple, Set
+from uuid import uuid4
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, RootModel
 
 
@@ -1289,4 +1290,358 @@ def repair(body: RepairRequest) -> RepairResponse:
   )
 
 
+# ---------- MVP workflow execution engine ----------
 
+
+class RunRequest(BaseModel):
+  workflow: Workflow
+  input: Optional[Any] = None
+
+
+class RunResponse(BaseModel):
+  run: ExecutionRun
+
+
+# In-memory run store for MVP. In a real system this would be persisted.
+RUNS: Dict[str, ExecutionRun] = {}
+
+
+def _topological_order(workflow: Workflow) -> List[Node]:
+  """
+  Simple Kahn-style topological sort. If cycles exist, falls back to original order.
+  """
+  node_ids = [n.id for n in workflow.nodes]
+  incoming_counts: Dict[str, int] = {nid: 0 for nid in node_ids}
+  outgoing: Dict[str, List[str]] = {nid: [] for nid in node_ids}
+
+  for edge in workflow.edges:
+    if edge.sourceNodeId in outgoing and edge.targetNodeId in incoming_counts:
+      outgoing[edge.sourceNodeId].append(edge.targetNodeId)
+      incoming_counts[edge.targetNodeId] += 1
+
+  queue: List[str] = [nid for nid, count in incoming_counts.items() if count == 0]
+  ordered_ids: List[str] = []
+
+  while queue:
+    nid = queue.pop(0)
+    ordered_ids.append(nid)
+    for tgt in outgoing.get(nid, []):
+      incoming_counts[tgt] -= 1
+      if incoming_counts[tgt] == 0:
+        queue.append(tgt)
+
+  if len(ordered_ids) != len(node_ids):
+    # Cycle or disconnected bits; fall back to declared order.
+    return workflow.nodes
+
+  index = {n.id: n for n in workflow.nodes}
+  return [index[nid] for nid in ordered_ids if nid in index]
+
+
+def _resolve_reference_string(ref: str, results: Dict[str, Any]) -> Any:
+  parsed = _parse_reference(ref)
+  if not parsed:
+    return ref
+  node_id, output_key, field = parsed
+  node_output = results.get(node_id)
+  if not isinstance(node_output, dict):
+    return None
+  value = node_output.get(output_key)
+  if field and isinstance(value, dict):
+    return value.get(field)
+  return value
+
+
+def _resolve_references_in_value(value: Any, results: Dict[str, Any]) -> Any:
+  if isinstance(value, str):
+    if value.startswith("{{") and value.endswith("}}"):
+      return _resolve_reference_string(value, results)
+    return value
+  if isinstance(value, dict):
+    return {k: _resolve_references_in_value(v, results) for k, v in value.items()}
+  if isinstance(value, list):
+    return [_resolve_references_in_value(v, results) for v in value]
+  return value
+
+
+def _build_node_input(
+  node: Node,
+  workflow: Workflow,
+  run_input: Any,
+  results: Dict[str, Any],
+) -> Dict[str, Any]:
+  incoming_edges = [e for e in workflow.edges if e.targetNodeId == node.id]
+  upstream_outputs: List[Any] = []
+  for edge in incoming_edges:
+    if edge.sourceNodeId in results:
+      upstream_outputs.append(results[edge.sourceNodeId])
+
+  node_input: Dict[str, Any] = {
+    "upstream": upstream_outputs,
+  }
+
+  # For triggers, also pass through initial run_input for convenience.
+  if node.type == "input" and run_input is not None:
+    node_input["payload"] = run_input
+
+  # Include resolved config values.
+  if node.config is not None:
+    node_input["config"] = _resolve_references_in_value(node.config.root, results)
+
+  return node_input
+
+
+def _execute_node(
+  node: Node,
+  node_input: Dict[str, Any],
+  run_id: str,
+) -> Dict[str, Any]:
+  """
+  Execute a single node. For the MVP we implement simple, mostly mocked behavior
+  that is deterministic and easy to extend.
+  """
+  nid = node.id
+
+  # Triggers just echo payload or construct a simple event.
+  if nid in ("manual_trigger", "webhook_trigger", "gmail_trigger_mock"):
+    payload = node_input.get("payload") or (node_input.get("upstream") or [{}])
+    return {
+      "event": payload,
+      "trigger_type": nid,
+    }
+
+  # LLM-style operations: deterministic string operations for MVP.
+  if nid == "llm_summarize":
+    text = ""
+    cfg = node_input.get("config") or {}
+    if isinstance(cfg, dict) and isinstance(cfg.get("text"), str):
+      text = cfg["text"]
+    elif node_input.get("upstream"):
+      # Try to extract text from first upstream output
+      upstream0 = node_input["upstream"][0]
+      if isinstance(upstream0, dict) and isinstance(upstream0.get("text"), str):
+        text = upstream0["text"]
+      else:
+        text = str(upstream0)
+    summary = f"SUMMARY: {text[:200]}"
+    return {"summary": summary}
+
+  if nid == "llm_classify":
+    text = ""
+    if node_input.get("upstream"):
+      upstream0 = node_input["upstream"][0]
+      text = str(upstream0)
+    # Very naive classification: presence of some keywords.
+    lowered = text.lower()
+    if "urgent" in lowered or "asap" in lowered:
+      label = "urgent"
+    elif "bug" in lowered or "error" in lowered:
+      label = "bug"
+    else:
+      label = "general"
+    return {"label": label, "confidence": 0.5}
+
+  if nid == "llm_extract_fields":
+    text = ""
+    if node_input.get("upstream"):
+      text = str(node_input["upstream"][0])
+    return {"fields": {"raw_text_length": len(text)}}
+
+  # Mock side-effect integrations.
+  if nid == "slack_send":
+    message = {
+      "text": None,
+      "channel": None,
+    }
+    cfg = node_input.get("config") or {}
+    if isinstance(cfg, dict):
+      message["channel"] = cfg.get("channel")
+    if node_input.get("upstream"):
+      message["text"] = str(node_input["upstream"][0])
+    return {"ok": True, "message": message}
+
+  if nid == "notion_create_page":
+    cfg = node_input.get("config") or {}
+    title = None
+    if isinstance(cfg, dict):
+      title = cfg.get("title") or "Untitled"
+    page_id = f"notion-{run_id}-{node.id}"
+    return {"id": page_id, "title": title}
+
+  if nid == "http_request":
+    # For MVP, do not perform real network calls. Just echo the intended request.
+    cfg = node_input.get("config") or {}
+    body = None
+    if node_input.get("upstream"):
+      body = node_input["upstream"][0]
+    return {
+      "status": 200,
+      "body": {
+        "mock": True,
+        "method": (cfg.get("method") if isinstance(cfg, dict) else None),
+        "url": (cfg.get("url") if isinstance(cfg, dict) else None),
+        "payload": body,
+      },
+    }
+
+  if nid == "branch_condition":
+    # Expect a boolean 'condition' in config or upstream.
+    condition = None
+    cfg = node_input.get("config") or {}
+    if isinstance(cfg, dict) and isinstance(cfg.get("condition"), bool):
+      condition = cfg["condition"]
+    elif node_input.get("upstream"):
+      upstream0 = node_input["upstream"][0]
+      if isinstance(upstream0, dict) and isinstance(upstream0.get("condition"), bool):
+        condition = upstream0["condition"]
+    if condition is None:
+      condition = False
+    return {"condition": condition}
+
+  if nid == "wait_delay":
+    # Do not actually sleep; just acknowledge the delay setting.
+    cfg = node_input.get("config") or {}
+    duration = None
+    if isinstance(cfg, dict):
+      duration = cfg.get("duration_seconds")
+    return {"waited_seconds": duration or 0}
+
+  if nid == "human_approval":
+    # Placeholder: auto-approve for MVP.
+    return {"approved": True, "note": "Auto-approved by placeholder executor."}
+
+  # Default behavior: echo input for unknown nodes.
+  return {"echo": node_input}
+
+
+def execute_workflow(
+  workflow: Workflow,
+  run_input: Any = None,
+  previous_run: Optional[ExecutionRun] = None,
+) -> ExecutionRun:
+  """
+  Execute a workflow sequentially in topological order. Uses previous_run to
+  support retrying failed steps by reusing successful outputs.
+  """
+  run_id = str(uuid4())
+  started_at = datetime.utcnow()
+
+  previous_steps_by_node: Dict[str, StepExecution] = {}
+  if previous_run is not None:
+    for step in previous_run.steps:
+      previous_steps_by_node[step.nodeId] = step
+
+  results: Dict[str, Any] = {}
+  steps: List[StepExecution] = []
+  overall_status: ExecutionStatus = "succeeded"
+  overall_error: Optional[str] = None
+
+  ordered_nodes = _topological_order(workflow)
+
+  for node in ordered_nodes:
+    prev_step = previous_steps_by_node.get(node.id)
+    if previous_run is not None and prev_step is not None and prev_step.status == "succeeded":
+      # Reuse previous successful step without re-executing.
+      results[node.id] = prev_step.output
+      steps.append(prev_step)
+      continue
+
+    step_started = datetime.utcnow()
+    node_input = _build_node_input(node, workflow, run_input, results)
+    status: NodeExecutionStatus = "succeeded"
+    error_msg: Optional[str] = None
+    output: Optional[Any] = None
+    logs: List[str] = []
+
+    try:
+      output = _execute_node(node, node_input, run_id)
+    except Exception as exc:  # pragma: no cover - defensive
+      status = "failed"
+      error_msg = str(exc)
+      overall_status = "failed"
+      overall_error = overall_error or f"Execution failed at node '{node.id}': {error_msg}"
+      logs.append(f"Exception during node execution: {error_msg}")
+
+    step_finished = datetime.utcnow()
+    step = StepExecution(
+      id=f"{run_id}:{node.id}",
+      nodeId=node.id,
+      status=status,
+      startedAt=step_started,
+      finishedAt=step_finished,
+      input=node_input,
+      output=output,
+      error=error_msg,
+      logs=logs or None,
+    )
+    steps.append(step)
+    results[node.id] = output
+
+  finished_at = datetime.utcnow()
+  run = ExecutionRun(
+    id=run_id,
+    workflowId=workflow.id,
+    status=overall_status,
+    startedAt=started_at,
+    finishedAt=finished_at,
+    steps=steps,
+    input=run_input,
+    output=(results.get(ordered_nodes[-1].id) if ordered_nodes else None),
+    error=overall_error,
+  )
+  RUNS[run_id] = run
+  return run
+
+
+@app.post("/run", response_model=RunResponse)
+def run_workflow_endpoint(body: RunRequest) -> RunResponse:
+  """
+  Execute a workflow once. The workflow should already be valid; clients can call
+  /validate (and optionally /repair) before invoking this endpoint.
+  """
+  validation = validate_workflow(body.workflow)
+  if not validation.is_valid:
+    raise HTTPException(
+      status_code=400,
+      detail={
+        "message": "Workflow is not valid; see validation_errors.",
+        "validation_errors": [e.model_dump() for e in validation.validation_errors],
+      },
+    )
+  run = execute_workflow(workflow=body.workflow, run_input=body.input)
+  return RunResponse(run=run)
+
+
+@app.get("/runs/{run_id}", response_model=ExecutionRun)
+def get_run(run_id: str) -> ExecutionRun:
+  run = RUNS.get(run_id)
+  if run is None:
+    raise HTTPException(status_code=404, detail="Run not found.")
+  return run
+
+
+@app.post("/runs/{run_id}/retry", response_model=RunResponse)
+def retry_run(run_id: str, body: RunRequest) -> RunResponse:
+  """
+  Retry failed steps of a previous run. Successful steps are reused without
+  re-executing; failed or missing steps are executed again.
+  """
+  previous = RUNS.get(run_id)
+  if previous is None:
+    raise HTTPException(status_code=404, detail="Run not found.")
+
+  # Execute the provided workflow again, reusing successful steps from the
+  # previous run. The client is responsible for ensuring the workflow shape
+  # is compatible between runs.
+  validation = validate_workflow(body.workflow)
+  if not validation.is_valid:
+    raise HTTPException(
+      status_code=400,
+      detail={
+        "message": "Workflow is not valid for retry; see validation_errors.",
+        "validation_errors": [e.model_dump() for e in validation.validation_errors],
+      },
+    )
+
+  new_run = execute_workflow(workflow=body.workflow, run_input=body.input, previous_run=previous)
+  return RunResponse(run=new_run)
