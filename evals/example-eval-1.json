@@ -1,0 +1,9 @@
+{
+  "id": "example-eval-1",
+  "description": "Simple evaluation of a three-step workflow generation.",
+  "prompt": "Create a three step workflow that takes user input, calls an LLM, and returns the result.",
+  "expected": {
+    "minNodes": 3,
+    "requiredKinds": ["input", "llm", "output"]
+  }
+}

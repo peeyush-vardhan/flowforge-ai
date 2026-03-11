@@ -1,0 +1,47 @@
+{
+  "id": "example-1",
+  "name": "Simple LLM workflow",
+  "description": "Takes user input, calls an LLM, and returns the result.",
+  "nodes": [
+    {
+      "id": "input",
+      "kind": "input",
+      "label": "User Input",
+      "outputs": [{ "id": "out", "label": "Output" }]
+    },
+    {
+      "id": "llm",
+      "kind": "llm",
+      "label": "LLM Call",
+      "inputs": [
+        { "id": "prompt", "label": "Prompt" },
+        { "id": "context", "label": "Context" }
+      ],
+      "outputs": [{ "id": "result", "label": "Result" }]
+    },
+    {
+      "id": "output",
+      "kind": "output",
+      "label": "Workflow Output",
+      "inputs": [{ "id": "in", "label": "Input" }]
+    }
+  ],
+  "edges": [
+    {
+      "id": "e1",
+      "sourceNodeId": "input",
+      "sourcePortId": "out",
+      "targetNodeId": "llm",
+      "targetPortId": "prompt",
+      "label": "prompt"
+    },
+    {
+      "id": "e2",
+      "sourceNodeId": "llm",
+      "sourcePortId": "result",
+      "targetNodeId": "output",
+      "targetPortId": "in",
+      "label": "result"
+    }
+  ]
+}
