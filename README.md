@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # FlowForge AI Monorepo
 
 FlowForge AI is an AI workflow builder that converts natural language into executable workflow graphs.
@@ -39,4 +40,3 @@ The web app will typically run on `http://localhost:3000` and the API on `http:/
 ## Environment variables
 
 See `.env.example` for configuration. The current setup does not require any secrets to run locally.
-
