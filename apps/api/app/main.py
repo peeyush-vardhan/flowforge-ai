@@ -1,44 +1,115 @@
 from datetime import datetime
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-WorkflowNodeKind = Literal["input", "llm", "tool", "branch", "output"]
+
+NodeType = Literal["input", "llm", "tool", "branch", "output"]
+WorkflowNodeKind = NodeType
+
+NodeOutputReference = str
+
+WorkflowStatus = Literal["draft", "active", "archived"]
+ExecutionStatus = Literal["queued", "running", "succeeded", "failed", "cancelled"]
+NodeExecutionStatus = Literal["pending", "running", "succeeded", "failed", "skipped"]
 
 
-class WorkflowNodeIOPort(BaseModel):
+class WorkflowPort(BaseModel):
   id: str
   label: str
 
 
-class WorkflowNode(BaseModel):
+class NodeConfig(BaseModel):
+  __root__: Dict[str, Any | NodeOutputReference]
+
+
+class Node(BaseModel):
   id: str
-  kind: WorkflowNodeKind
+  type: NodeType
   label: str
   description: Optional[str] = None
-  inputs: Optional[List[WorkflowNodeIOPort]] = None
-  outputs: Optional[List[WorkflowNodeIOPort]] = None
-  config: Optional[dict] = None
+  inputs: Optional[List[WorkflowPort]] = None
+  outputs: Optional[List[WorkflowPort]] = None
+  config: Optional[NodeConfig] = None
 
 
-class WorkflowEdge(BaseModel):
+class WorkflowNode(Node):
+  kind: Optional[WorkflowNodeKind] = None
+
+
+class Edge(BaseModel):
   id: str
   sourceNodeId: str
   sourcePortId: Optional[str] = None
   targetNodeId: str
   targetPortId: Optional[str] = None
   label: Optional[str] = None
+  condition: Optional[str] = None
 
 
-class WorkflowGraph(BaseModel):
+class Workflow(BaseModel):
   id: str
   name: str
   description: Optional[str] = None
-  nodes: List[WorkflowNode]
-  edges: List[WorkflowEdge]
+  nodes: List[Node]
+  edges: List[Edge]
   createdAt: Optional[datetime] = None
   updatedAt: Optional[datetime] = None
+  version: Optional[int] = None
+  status: Optional[WorkflowStatus] = None
+
+
+WorkflowGraph = Workflow
+
+
+class StepExecution(BaseModel):
+  id: str
+  nodeId: str
+  status: NodeExecutionStatus
+  startedAt: Optional[datetime] = None
+  finishedAt: Optional[datetime] = None
+  input: Optional[Any] = None
+  output: Optional[Any] = None
+  error: Optional[str] = None
+  logs: Optional[List[str]] = None
+
+
+class ExecutionRun(BaseModel):
+  id: str
+  workflowId: str
+  status: ExecutionStatus
+  startedAt: Optional[datetime] = None
+  finishedAt: Optional[datetime] = None
+  steps: List[StepExecution]
+  input: Optional[Any] = None
+  output: Optional[Any] = None
+  error: Optional[str] = None
+
+
+class ValidationError(BaseModel):
+  code: str
+  message: str
+  path: Optional[List[str]] = None
+  nodeId: Optional[str] = None
+
+
+class DecomposedStep(BaseModel):
+  id: str
+  summary: str
+  detail: Optional[str] = None
+  dependsOn: Optional[List[str]] = None
+
+
+class PlannerOutput(BaseModel):
+  workflow: Workflow
+  validationErrors: Optional[List[ValidationError]] = None
+  reasoning: Optional[str] = None
+
+
+class DecompositionOutput(BaseModel):
+  originalPrompt: str
+  steps: List[DecomposedStep]
 
 
 class CompileRequest(BaseModel):
@@ -46,7 +117,7 @@ class CompileRequest(BaseModel):
 
 
 class CompileResponse(BaseModel):
-  workflow: WorkflowGraph
+  workflow: Workflow
 
 
 app = FastAPI(
@@ -69,27 +140,51 @@ def compile_workflow(body: CompileRequest) -> CompileResponse:
   would call an LLM and synthesize a graph.
   """
   now = datetime.utcnow()
-  workflow = WorkflowGraph(
+  workflow = Workflow(
     id="example-1",
     name="Example workflow",
     description="Example graph synthesized from natural language.",
     nodes=[
-      WorkflowNode(id="input", kind="input", label="User Input", outputs=[WorkflowNodeIOPort(id="out", label="Output")]),
-      WorkflowNode(
+      Node(
+        id="input",
+        type="input",
+        label="User Input",
+        outputs=[WorkflowPort(id="out", label="Output")],
+      ),
+      Node(
         id="llm",
-        kind="llm",
+        type="llm",
         label="LLM Call",
         inputs=[
-          WorkflowNodeIOPort(id="prompt", label="Prompt"),
-          WorkflowNodeIOPort(id="context", label="Context"),
+          WorkflowPort(id="prompt", label="Prompt"),
+          WorkflowPort(id="context", label="Context"),
         ],
-        outputs=[WorkflowNodeIOPort(id="result", label="Result")],
+        outputs=[WorkflowPort(id="result", label="Result")],
       ),
-      WorkflowNode(id="output", kind="output", label="Workflow Output", inputs=[WorkflowNodeIOPort(id="in", label="Input")]),
+      Node(
+        id="output",
+        type="output",
+        label="Workflow Output",
+        inputs=[WorkflowPort(id="in", label="Input")],
+      ),
     ],
     edges=[
-      WorkflowEdge(id="e1", sourceNodeId="input", sourcePortId="out", targetNodeId="llm", targetPortId="prompt", label="prompt"),
-      WorkflowEdge(id="e2", sourceNodeId="llm", sourcePortId="result", targetNodeId="output", targetPortId="in", label="result"),
+      Edge(
+        id="e1",
+        sourceNodeId="input",
+        sourcePortId="out",
+        targetNodeId="llm",
+        targetPortId="prompt",
+        label="prompt",
+      ),
+      Edge(
+        id="e2",
+        sourceNodeId="llm",
+        sourcePortId="result",
+        targetNodeId="output",
+        targetPortId="in",
+        label="result",
+      ),
     ],
     createdAt=now,
     updatedAt=now,

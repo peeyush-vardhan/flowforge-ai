@@ -1,4 +1,4 @@
-"use client";
+'use client';
 
 import React, { useCallback, useState } from "react";
 import ReactFlow, {
@@ -6,10 +6,15 @@ import ReactFlow, {
   Controls,
   MiniMap,
   addEdge,
+  applyEdgeChanges,
+  applyNodeChanges,
   Connection,
   Edge,
-  Node
+  Node,
+  OnEdgesChange,
+  OnNodesChange
 } from "reactflow";
+import type { Workflow } from "@flowforge/shared-types";
 import "reactflow/dist/style.css";
 
 import { Button } from "../components/ui/button";
@@ -43,11 +48,64 @@ const initialEdges: Edge[] = [
   { id: "e2-3", source: "2", target: "3" }
 ];
 
+const sampleWorkflow: Workflow = {
+  id: "example-1",
+  name: "Example workflow",
+  description: "Example graph synthesized from natural language.",
+  nodes: [
+    { id: "input", type: "input", label: "User Input", outputs: [{ id: "out", label: "Output" }] },
+    {
+      id: "llm",
+      type: "llm",
+      label: "LLM Call",
+      inputs: [
+        { id: "prompt", label: "Prompt" },
+        { id: "context", label: "Context" }
+      ],
+      outputs: [{ id: "result", label: "Result" }]
+    },
+    {
+      id: "output",
+      type: "output",
+      label: "Workflow Output",
+      inputs: [{ id: "in", label: "Input" }]
+    }
+  ],
+  edges: [
+    {
+      id: "e1",
+      sourceNodeId: "input",
+      sourcePortId: "out",
+      targetNodeId: "llm",
+      targetPortId: "prompt",
+      label: "prompt"
+    },
+    {
+      id: "e2",
+      sourceNodeId: "llm",
+      sourcePortId: "result",
+      targetNodeId: "output",
+      targetPortId: "in",
+      label: "result"
+    }
+  ]
+};
+
 export default function HomePage() {
   const [nodes, setNodes] = useState<Node<WorkflowNodeData>[]>(initialNodes);
   const [edges, setEdges] = useState<Edge[]>(initialEdges);
   const [prompt, setPrompt] = useState(
     "Create a three step workflow that takes user input, calls an LLM, and returns the result."
+  );
+
+  const onNodesChange: OnNodesChange = useCallback(
+    (changes) => setNodes((nds) => applyNodeChanges(changes, nds)),
+    []
+  );
+
+  const onEdgesChange: OnEdgesChange = useCallback(
+    (changes) => setEdges((eds) => applyEdgeChanges(changes, eds)),
+    []
   );
 
   const onConnect = useCallback(
@@ -58,7 +116,7 @@ export default function HomePage() {
   const handleGenerate = () => {
     // Placeholder: in a real app this would call the API to compile
     // the natural language prompt into a workflow graph.
-    console.log("Generate workflow from prompt:", prompt);
+    console.log("Generate workflow from prompt:", prompt, "using workflow schema", sampleWorkflow);
   };
 
   return (
@@ -106,8 +164,8 @@ export default function HomePage() {
           <ReactFlow
             nodes={nodes}
             edges={edges}
-            onNodesChange={setNodes}
-            onEdgesChange={setEdges}
+            onNodesChange={onNodesChange}
+            onEdgesChange={onEdgesChange}
             onConnect={onConnect}
             fitView
           >
