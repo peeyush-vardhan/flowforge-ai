@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # FlowForge AI Monorepo
 
 FlowForge AI is an AI workflow builder that converts natural language into executable workflow graphs.
