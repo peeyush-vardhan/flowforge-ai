@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Set
 
 from fastapi import FastAPI
 from pydantic import BaseModel, RootModel
@@ -715,5 +715,389 @@ def compile_workflow_legacy(body: LegacyCompileRequest) -> LegacyCompileResponse
     updatedAt=now,
   )
   return LegacyCompileResponse(workflow=workflow)
+
+
+# ---------- Deterministic workflow validator ----------
+
+
+class ValidateRequest(BaseModel):
+  workflow: Workflow
+
+
+class ValidateResponse(BaseModel):
+  is_valid: bool
+  validation_errors: List[ValidationError]
+  warnings: List[str]
+  repair_hints: List[str]
+
+
+def _build_node_index(workflow: Workflow) -> Dict[str, Node]:
+  return {node.id: node for node in workflow.nodes}
+
+
+def _check_exactly_one_trigger(workflow: Workflow, registry: Dict[str, RegistryNode]) -> List[ValidationError]:
+  errors: List[ValidationError] = []
+  trigger_nodes: List[Node] = []
+
+  for node in workflow.nodes:
+    reg = registry.get(node.id)
+    is_trigger = (reg is not None and reg.category == "triggers") or node.type == "input"
+    if is_trigger:
+      trigger_nodes.append(node)
+
+  if len(trigger_nodes) != 1:
+    errors.append(
+      ValidationError(
+        code="TRIGGER_COUNT_INVALID",
+        message=f"Workflow must contain exactly one trigger node, found {len(trigger_nodes)}.",
+        path=["nodes"],
+      )
+    )
+
+  return errors
+
+
+def _check_edges_point_to_valid_nodes(workflow: Workflow) -> List[ValidationError]:
+  errors: List[ValidationError] = []
+  node_ids: Set[str] = {n.id for n in workflow.nodes}
+
+  for idx, edge in enumerate(workflow.edges):
+    if edge.sourceNodeId not in node_ids:
+      errors.append(
+        ValidationError(
+          code="EDGE_INVALID_SOURCE",
+          message=f"Edge '{edge.id}' has invalid source node id '{edge.sourceNodeId}'.",
+          path=["edges", str(idx), "sourceNodeId"],
+          nodeId=edge.sourceNodeId,
+        )
+      )
+    if edge.targetNodeId not in node_ids:
+      errors.append(
+        ValidationError(
+          code="EDGE_INVALID_TARGET",
+          message=f"Edge '{edge.id}' has invalid target node id '{edge.targetNodeId}'.",
+          path=["edges", str(idx), "targetNodeId"],
+          nodeId=edge.targetNodeId,
+        )
+      )
+
+  return errors
+
+
+def _check_graph_connected(workflow: Workflow) -> List[ValidationError]:
+  errors: List[ValidationError] = []
+  if not workflow.nodes:
+    return errors
+
+  node_ids: Set[str] = {n.id for n in workflow.nodes}
+  adjacency: Dict[str, Set[str]] = {nid: set() for nid in node_ids}
+
+  for edge in workflow.edges:
+    if edge.sourceNodeId in adjacency and edge.targetNodeId in adjacency:
+      adjacency[edge.sourceNodeId].add(edge.targetNodeId)
+      adjacency[edge.targetNodeId].add(edge.sourceNodeId)
+
+  # Start from any node and perform undirected DFS/BFS
+  start = next(iter(node_ids))
+  visited: Set[str] = set()
+  stack: List[str] = [start]
+
+  while stack:
+    current = stack.pop()
+    if current in visited:
+      continue
+    visited.add(current)
+    stack.extend(n for n in adjacency[current] if n not in visited)
+
+  if visited != node_ids:
+    disconnected = node_ids - visited
+    errors.append(
+      ValidationError(
+        code="GRAPH_DISCONNECTED",
+        message=f"Workflow graph is not connected; unreachable node ids: {sorted(disconnected)}.",
+        path=["nodes"],
+      )
+    )
+
+  return errors
+
+
+REQUIRED_CONFIG_KEYS: Dict[str, List[str]] = {
+  "http_request": ["method", "url"],
+  "slack_send": ["channel"],
+  "notion_create_page": ["database_id"],
+  "wait_delay": ["duration_seconds"],
+}
+
+
+def _check_required_configs(workflow: Workflow) -> List[ValidationError]:
+  errors: List[ValidationError] = []
+
+  for idx, node in enumerate(workflow.nodes):
+    required_keys = REQUIRED_CONFIG_KEYS.get(node.id)
+    if not required_keys:
+      continue
+
+    if node.config is None:
+      errors.append(
+        ValidationError(
+          code="CONFIG_MISSING",
+          message=f"Node '{node.id}' requires config with keys {required_keys}, but config is missing.",
+          path=["nodes", str(idx), "config"],
+          nodeId=node.id,
+        )
+      )
+      continue
+
+    config_dict = node.config.root  # RootModel internal data
+    for key in required_keys:
+      if key not in config_dict:
+        errors.append(
+          ValidationError(
+            code="CONFIG_KEY_MISSING",
+            message=f"Node '{node.id}' config is missing required key '{key}'.",
+            path=["nodes", str(idx), "config", key],
+            nodeId=node.id,
+          )
+        )
+
+  return errors
+
+
+def _iter_string_values(value: Any) -> List[str]:
+  """Collect all string values from nested dicts/lists."""
+  strings: List[str] = []
+  if isinstance(value, str):
+    strings.append(value)
+  elif isinstance(value, dict):
+    for v in value.values():
+      strings.extend(_iter_string_values(v))
+  elif isinstance(value, list):
+    for v in value:
+      strings.extend(_iter_string_values(v))
+  return strings
+
+
+def _parse_reference(ref: str) -> Optional[Tuple[str, str, Optional[str]]]:
+  """
+  Parse a reference of the form '{{nodeId.output.field}}'.
+  Returns (node_id, output_id, field) or None if not in the expected shape.
+  """
+  if not (ref.startswith("{{") and ref.endswith("}}")):
+    return None
+  inner = ref[2:-2].strip()
+  parts = inner.split(".")
+  if len(parts) < 2:
+    return None
+  node_id = parts[0]
+  output_id = parts[1]
+  field = parts[2] if len(parts) > 2 else None
+  return node_id, output_id, field
+
+
+def _check_references(workflow: Workflow) -> List[ValidationError]:
+  errors: List[ValidationError] = []
+  node_index = _build_node_index(workflow)
+
+  # Validate references in node configs
+  for idx, node in enumerate(workflow.nodes):
+    if node.config is None:
+      continue
+    config_dict = node.config.root
+    for s in _iter_string_values(config_dict):
+      parsed = _parse_reference(s)
+      if not parsed:
+        continue
+      ref_node_id, ref_output_id, _ = parsed
+      target_node = node_index.get(ref_node_id)
+      if target_node is None:
+        errors.append(
+          ValidationError(
+            code="REFERENCE_UNKNOWN_NODE",
+            message=f"Config on node '{node.id}' references unknown node id '{ref_node_id}'.",
+            path=["nodes", str(idx), "config"],
+            nodeId=node.id,
+          )
+        )
+        continue
+      if not target_node.outputs or all(p.id != ref_output_id for p in target_node.outputs):
+        errors.append(
+          ValidationError(
+            code="REFERENCE_UNKNOWN_OUTPUT",
+            message=f"Config on node '{node.id}' references unknown output '{ref_output_id}' on node '{ref_node_id}'.",
+            path=["nodes", str(idx), "config"],
+            nodeId=node.id,
+          )
+        )
+
+  # Validate references in edge conditions
+  for idx, edge in enumerate(workflow.edges):
+    if not edge.condition:
+      continue
+    parsed = _parse_reference(edge.condition)
+    if not parsed:
+      continue
+    ref_node_id, ref_output_id, _ = parsed
+    target_node = node_index.get(ref_node_id)
+    if target_node is None:
+      errors.append(
+        ValidationError(
+          code="REFERENCE_UNKNOWN_NODE",
+          message=f"Edge '{edge.id}' condition references unknown node id '{ref_node_id}'.",
+          path=["edges", str(idx), "condition"],
+          nodeId=ref_node_id,
+        )
+      )
+      continue
+    if not target_node.outputs or all(p.id != ref_output_id for p in target_node.outputs):
+      errors.append(
+        ValidationError(
+          code="REFERENCE_UNKNOWN_OUTPUT",
+          message=f"Edge '{edge.id}' condition references unknown output '{ref_output_id}' on node '{ref_node_id}'.",
+          path=["edges", str(idx), "condition"],
+          nodeId=ref_node_id,
+        )
+      )
+
+  return errors
+
+
+def _check_branch_conditions(workflow: Workflow, registry: Dict[str, RegistryNode]) -> List[ValidationError]:
+  errors: List[ValidationError] = []
+  outgoing_by_node: Dict[str, int] = {}
+  for edge in workflow.edges:
+    outgoing_by_node[edge.sourceNodeId] = outgoing_by_node.get(edge.sourceNodeId, 0) + 1
+
+  for idx, node in enumerate(workflow.nodes):
+    reg = registry.get(node.id)
+    if reg is None or reg.id != "branch_condition":
+      continue
+    outgoing = outgoing_by_node.get(node.id, 0)
+    if outgoing < 2:
+      errors.append(
+        ValidationError(
+          code="BRANCH_EDGES_INSUFFICIENT",
+          message=f"branch_condition node '{node.id}' must have at least two outgoing edges, found {outgoing}.",
+          path=["nodes", str(idx)],
+          nodeId=node.id,
+        )
+      )
+
+  return errors
+
+
+def _check_node_category_usage(
+  workflow: Workflow,
+  registry: Dict[str, RegistryNode],
+) -> Tuple[List[ValidationError], List[str]]:
+  errors: List[ValidationError] = []
+  warnings: List[str] = []
+
+  node_index = _build_node_index(workflow)
+  incoming_counts: Dict[str, int] = {n.id: 0 for n in workflow.nodes}
+  for edge in workflow.edges:
+    if edge.targetNodeId in incoming_counts:
+      incoming_counts[edge.targetNodeId] += 1
+
+  for node in workflow.nodes:
+    reg = registry.get(node.id)
+    if reg is None:
+      warnings.append(f"Node '{node.id}' is not in the registry; validator may miss some structural checks.")
+      continue
+
+    # Triggers should not have incoming edges.
+    if reg.category == "triggers" and incoming_counts.get(node.id, 0) > 0:
+      errors.append(
+        ValidationError(
+          code="TRIGGER_HAS_INCOMING_EDGE",
+          message=f"Trigger node '{node.id}' should not have incoming edges.",
+          path=["nodes"],
+          nodeId=node.id,
+        )
+      )
+
+    # Control nodes should not be the only node.
+    if reg.category == "control" and len(workflow.nodes) == 1:
+      errors.append(
+        ValidationError(
+          code="CONTROL_NODE_LONE",
+          message=f"Control node '{node.id}' cannot be the only node in a workflow.",
+          path=["nodes"],
+          nodeId=node.id,
+        )
+      )
+
+  # Ensure at least one non-trigger node when a trigger exists.
+  trigger_ids = {n.id for n in workflow.nodes if registry.get(n.id) and registry[n.id].category == "triggers"}
+  if trigger_ids and len(workflow.nodes) == len(trigger_ids):
+    warnings.append("Workflow contains only trigger nodes and no actions; it may not perform any useful work.")
+
+  # Quick reachability sanity check from the trigger node (if exactly one trigger).
+  trigger_nodes = [n for n in workflow.nodes if registry.get(n.id) and registry[n.id].category == "triggers"]
+  if len(trigger_nodes) == 1:
+    trigger = trigger_nodes[0]
+    reachable: Set[str] = set()
+    stack: List[str] = [trigger.id]
+    outgoing: Dict[str, List[str]] = {n.id: [] for n in workflow.nodes}
+    for edge in workflow.edges:
+      if edge.sourceNodeId in outgoing and edge.targetNodeId in node_index:
+        outgoing[edge.sourceNodeId].append(edge.targetNodeId)
+    while stack:
+      nid = stack.pop()
+      if nid in reachable:
+        continue
+      reachable.add(nid)
+      stack.extend(outgoing.get(nid, []))
+    unreachable = [n.id for n in workflow.nodes if n.id not in reachable]
+    if unreachable:
+      warnings.append(
+        f"The following nodes are not reachable from the trigger '{trigger.id}': {sorted(unreachable)}."
+      )
+
+  return errors, warnings
+
+
+def validate_workflow(workflow: Workflow) -> ValidateResponse:
+  registry_by_id: Dict[str, RegistryNode] = {n.id: n for n in NODE_REGISTRY}
+
+  errors: List[ValidationError] = []
+  warnings: List[str] = []
+  repair_hints: List[str] = []
+
+  errors.extend(_check_exactly_one_trigger(workflow, registry_by_id))
+  errors.extend(_check_edges_point_to_valid_nodes(workflow))
+  errors.extend(_check_graph_connected(workflow))
+  errors.extend(_check_required_configs(workflow))
+  errors.extend(_check_references(workflow))
+  errors.extend(_check_branch_conditions(workflow, registry_by_id))
+
+  category_errors, category_warnings = _check_node_category_usage(workflow, registry_by_id)
+  errors.extend(category_errors)
+  warnings.extend(category_warnings)
+
+  if errors:
+    repair_hints.append(
+      "Review validation_errors and fix trigger selection, connectivity, edge endpoints, "
+      "node configs, and references. Ensure branch_condition nodes have two outgoing edges "
+      "and triggers do not receive incoming edges."
+    )
+
+  is_valid = not errors
+  return ValidateResponse(
+    is_valid=is_valid,
+    validation_errors=errors,
+    warnings=warnings,
+    repair_hints=repair_hints,
+  )
+
+
+@app.post("/validate", response_model=ValidateResponse)
+def validate(body: ValidateRequest) -> ValidateResponse:
+  """
+  Deterministic workflow validator that checks structural correctness of a workflow
+  graph without using any LLMs.
+  """
+  return validate_workflow(body.workflow)
+
 
 
