@@ -1100,4 +1100,193 @@ def validate(body: ValidateRequest) -> ValidateResponse:
   return validate_workflow(body.workflow)
 
 
+# ---------- Deterministic workflow repair service ----------
+
+
+class RepairRequest(BaseModel):
+  original_prompt: str
+  workflow: Workflow
+  validation_errors: List[ValidationError]
+  node_registry_context: Optional[List[RegistryNode]] = None
+
+
+class RepairResponse(BaseModel):
+  repaired_workflow: Workflow
+  repair_notes: List[str]
+  is_valid: bool
+  validation_errors_after_repair: List[ValidationError]
+
+
+def repair_workflow(
+  workflow: Workflow,
+  validation_errors: List[ValidationError],
+) -> Tuple[Workflow, List[str], ValidateResponse]:
+  """
+  Best-effort, deterministic repair of a workflow by fixing common structural
+  issues while preserving valid parts. Does not regenerate the entire graph.
+  """
+  # Work on a deep copy so we never mutate caller state.
+  wf = workflow.model_copy(deep=True)
+  notes: List[str] = []
+
+  registry_by_id: Dict[str, RegistryNode] = {n.id: n for n in NODE_REGISTRY}
+
+  # Helper indexes
+  node_index: Dict[str, Node] = _build_node_index(wf)
+
+  # 1. Remove edges pointing to invalid nodes (from EDGE_INVALID_SOURCE / EDGE_INVALID_TARGET).
+  invalid_edge_ids: Set[str] = set()
+  node_ids: Set[str] = {n.id for n in wf.nodes}
+  for edge in wf.edges:
+    if edge.sourceNodeId not in node_ids or edge.targetNodeId not in node_ids:
+      invalid_edge_ids.add(edge.id)
+  if invalid_edge_ids:
+    wf.edges = [e for e in wf.edges if e.id not in invalid_edge_ids]
+    notes.append(
+      f"Removed {len(invalid_edge_ids)} edges that pointed to missing source/target nodes."
+    )
+
+  # 2. Ensure required configs exist and have the required keys.
+  config_fixes = 0
+  for idx, node in enumerate(wf.nodes):
+    required_keys = REQUIRED_CONFIG_KEYS.get(node.id)
+    if not required_keys:
+      continue
+
+    if node.config is None:
+      # Create a minimal config with required keys set to None.
+      config_dict: Dict[str, Any] = {k: None for k in required_keys}
+      node.config = NodeConfig(root=config_dict)
+      config_fixes += 1
+      continue
+
+    config_dict = dict(node.config.root or {})
+    changed = False
+    for key in required_keys:
+      if key not in config_dict:
+        config_dict[key] = None
+        changed = True
+    if changed:
+      node.config = NodeConfig(root=config_dict)
+      config_fixes += 1
+
+  if config_fixes:
+    notes.append(f"Filled in missing config objects/keys on {config_fixes} node(s).")
+
+  # 3. Ensure branch_condition nodes have at least two outgoing edges.
+  outgoing_by_node: Dict[str, List[Edge]] = {}
+  for edge in wf.edges:
+    outgoing_by_node.setdefault(edge.sourceNodeId, []).append(edge)
+
+  branch_edges_added = 0
+  for node in wf.nodes:
+    reg = registry_by_id.get(node.id)
+    if reg is None or reg.id != "branch_condition":
+      continue
+    outgoing = outgoing_by_node.get(node.id, [])
+    if len(outgoing) == 1:
+      # Duplicate the sole edge to provide a second branch to the same target.
+      base_edge = outgoing[0]
+      new_edge = Edge(
+        id=f"{base_edge.id}_alt",
+        sourceNodeId=base_edge.sourceNodeId,
+        sourcePortId=base_edge.sourcePortId,
+        targetNodeId=base_edge.targetNodeId,
+        targetPortId=base_edge.targetPortId,
+        label=base_edge.label,
+        condition=base_edge.condition,
+      )
+      wf.edges.append(new_edge)
+      branch_edges_added += 1
+    elif len(outgoing) == 0:
+      # No outgoing edges; connect to the next node in sequence if possible.
+      if len(wf.nodes) > 1:
+        target = next((n for n in wf.nodes if n.id != node.id), None)
+        if target is not None:
+          new_edge = Edge(
+            id=f"e_branch_{node.id}",
+            sourceNodeId=node.id,
+            sourcePortId=(node.outputs[0].id if node.outputs else None),
+            targetNodeId=target.id,
+            targetPortId=(target.inputs[0].id if target.inputs else None),
+          )
+          wf.edges.append(new_edge)
+          branch_edges_added += 1
+  if branch_edges_added:
+    notes.append(
+      f"Added {branch_edges_added} outgoing edge(s) for branch_condition node(s) to satisfy branching requirements."
+    )
+
+  # 4. Remove incoming edges to trigger nodes (TRIGGER_HAS_INCOMING_EDGE).
+  trigger_ids: Set[str] = set()
+  for n in wf.nodes:
+    reg = registry_by_id.get(n.id)
+    if reg is not None and reg.category == "triggers":
+      trigger_ids.add(n.id)
+  if trigger_ids:
+    kept_edges: List[Edge] = []
+    removed_count = 0
+    for edge in wf.edges:
+      if edge.targetNodeId in trigger_ids:
+        removed_count += 1
+        continue
+      kept_edges.append(edge)
+    if removed_count:
+      wf.edges = kept_edges
+      notes.append(
+        f"Removed {removed_count} incoming edge(s) targeting trigger node(s) to enforce trigger semantics."
+      )
+
+  # 5. If there are no trigger nodes at all, add a manual_trigger (if available).
+  trigger_nodes = [n for n in wf.nodes if registry_by_id.get(n.id) and registry_by_id[n.id].category == "triggers"]
+  if not trigger_nodes and "manual_trigger" in registry_by_id:
+    manual = registry_by_id["manual_trigger"]
+    trigger_node = Node(
+      id=manual.id,
+      type=manual.node_type,
+      label=manual.display_name,
+      description=manual.description,
+      outputs=[WorkflowPort(id="event", label="Event")],
+    )
+    wf.nodes.insert(0, trigger_node)
+    node_index = _build_node_index(wf)
+    # Connect trigger to previous first node if it existed.
+    if len(wf.nodes) > 1:
+      target = wf.nodes[1]
+      wf.edges.append(
+        Edge(
+          id="e_trigger",
+          sourceNodeId=trigger_node.id,
+          sourcePortId="event",
+          targetNodeId=target.id,
+          targetPortId=(target.inputs[0].id if target.inputs else None),
+        )
+      )
+    notes.append("Inserted 'manual_trigger' node as a trigger because none were present.")
+
+  # Re-run full validation on the repaired workflow.
+  validate_result = validate_workflow(wf)
+
+  return wf, notes, validate_result
+
+
+@app.post("/repair", response_model=RepairResponse)
+def repair(body: RepairRequest) -> RepairResponse:
+  """
+  Deterministic repair endpoint that attempts to fix common structural issues in a
+  workflow without regenerating it from scratch. Valid parts of the workflow are
+  preserved whenever possible.
+  """
+  repaired_workflow, notes, validate_result = repair_workflow(
+    workflow=body.workflow,
+    validation_errors=body.validation_errors,
+  )
+  return RepairResponse(
+    repaired_workflow=repaired_workflow,
+    repair_notes=notes,
+    is_valid=validate_result.is_valid,
+    validation_errors_after_repair=validate_result.validation_errors,
+  )
+
+
 
